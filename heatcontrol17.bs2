@@ -1,0 +1,336 @@
+                                                                                                                          ' {$STAMP BS2}
+' {$PBASIC 2.5}
+'This Version added Data Aquistin via PLX-DAQ circa Nov 2008
+'***************Heatercontrol6 version notes*******************
+'This version was modified to reduce the data acq rate as well as reduce the water temp fan on threshold to
+'account for the addition of a 75 gallon hot water heater added to supplement the 40 gallon for a total water
+'volume of 115 gallons.
+'Increased dat_ctr from 6 to 24 to slow down acq rate.
+'Decreasd flue temp threshold for freeze protection from 75 t0 65.
+'Decreased fan on water temp threshold from 140 t0 132.
+'11/15/09
+'********Version 7****************
+'Reduced hysteris on room temp condition
+'Replaced
+' ELSEIF ((temp_room > (temp_room_sp + 0))AND(water_ot_flg = 0))OR((temp_water < 125 AND temp_flue >200)OR(temp_flue < 200 AND temp_water < 98)) THEN
+' With THis
+' ELSEIF ((temp_room >= (temp_room_sp + 0))AND(water_ot_flg = 0))OR((temp_water < 125 AND temp_flue >200)OR(temp_flue < 200 AND temp_water < 98)) THEN
+'********Version 8 12/31/09****************
+'Raised the drawdown temp with coldflue from 98 to 100 to prevent long furnace/pump on time with cold flue.
+'More heavily filtered flue temp in order to prevent pump toggling due to flue temp drop.
+' This:         temp_flue = (((x + temp_board - 77) * 25)+ (temp_flue * 5))/30
+' Became this:  temp_flue = (((x + temp_board - 77) * 15)+ (temp_flue * 15))/30
+'Also discovered that there was effectively no hysteris in logic to turn off pump due to low flue temp.
+'   Changed this:  ELSEIF temp_flue < 200 OR fan_flg = 0 THEN
+'   To this:        ELSEIF temp_flue < 200  THEN
+'*********Version 9  02/28/2010*******************
+'Discovered that as soon as the flue temp dropped below 150 with the water temp at 110 the fan/pump turn on even
+'if the room temp is above the setpoint.
+'Added rm_flg to simplify heat demand control, and added condition that rm_flg = 1 in order to draw the tank
+'down with low flue temp and intermediate water temp.
+'*********Version 10 010/31/2010*******************
+'Filtered more heavily room temp to prevent furnace fan oscillation. Decreased multiper on present temp value from 30 to 20.
+ '************VErsion 11 01/18/2011********************
+ 'Redid thermister lookups for 10x better resolution and reduced truncation hysterisis on fitering of temp_room, and
+ 'temp_room_sp. Note that all of these temps are now 10x actual deg F reading. Still sends 1x scale values to digital pots
+ 'for output to meters.
+ '************Version 12 12/10/2013********************************
+ 'Increased flue temps to turn on pump from 250 to 300 and increased off temp from 220
+ 'to 260
+ '****Version 13 01/01/2014********************************************************************
+ 'Problem with thermocouple reading intermittanty erroneously low remains. Must add logic to make sure pump
+ 'does  not go off until really can. Will call this Flue TC Noise Rejection.
+ 'Fixed TC reading problem. Root cause  was poor connection at TC connectors in fireplace.
+ 'COnnection gets too hot for plastic TC connectors. THey melt and coat the terminals with residue.
+ 'Elimnated problem by using all metal clap connectors and fiberglass cloth insulation.
+ 'One problem with this code is that when room_flg  calls  for heat during TC noise rejection loop then
+ 'drops  out the pump stays off. Not resolved.
+'***********************************************************************************************
+ '********************Version 15 02/18/2014*********************************
+ 'Fixed  a bunch if issues  with  the pump not going off on cooldown. Lots of mods labelled V15
+ 'Improved PLX-DAQ data acq.
+ '*********************************************************************    ***
+ '*********V17 Notes 231219 Started WOrk********************************
+ 'Purpose is to fix short cycling of fan.
+  counter VAR Byte '255
+  time VAR Word
+  x VAR Word
+  x_old VAR Word
+  'time_TC VAR Word 'For time debug purposes  Not needed ver 11
+
+  temp_water VAR Word
+  water_ot_flg VAR Bit ' bit flag indicating water overtemperature condtion.
+  temp_room_sp VAR Word'Temp setpoint to turn on furnace fan.
+  temp_room VAR Word ''Was Word Room temperature measurement
+  temp_flue VAR Word 'Flue Temperature measurement.
+  fact VAR Byte 'Was word
+  temp_board VAR Byte 'Temperature of control electronics board.
+  lp_num VAR Word
+  ctr_room VAR Byte
+  ctr_flue VAR Byte
+  ctr_water VAR Byte
+  fan_flg VAR Bit
+  low_flue VAR Bit
+  dat_ctr VAR Byte 'For PLX_DAQ
+  row_ctr VAR Word 'For PLX_DAQ
+  rm_flg VAR Bit ' Flag that indicates room temp below setpoint - need heat.
+
+  'Calibratable Constants
+  water_ot_flg = 0
+  temp_room = 1100 'Prevent fan from coming on before filter loads up.
+  temp_water = 700
+  temp_room_sp = 700
+
+  Main:
+   '***************PLX-DAQ Initialization*************************************
+  PAUSE 1000                             'Allow data communications to stabilize
+  SEROUT 16,84,[CR]                  'Send a lone CR to ensure PLX-DAQ buffer is ready
+  SEROUT 16,84,[CR,"LABEL,Time ,Timer,temp_flue, temp_water, temp_room, temp_room_sp, water_ot_flg, fan_flg, low_flue, rm_flg, ctr_flue, lp_num, pump cmd",CR]    'Label 3 columns"
+  SEROUT 16,84,["CLEARDATA",CR]      'Clear all data columns (A-J) in Excel
+  SEROUT 16,84,["RESETTIMER",CR]     'Reset Timer to 0
+  dat_ctr = 0
+  row_ctr = 2
+  '*******************************************************************************
+  'All digital pots power up with wiper at mid position (127)
+  'Output map for digital pots used for analog temperature out (Temp = mV)
+  'Output 2: SI pin for all chips (Send 16 bit control signal to digital pot.
+  ' First 8 bits are data bits, last 8 bits are control bits.)
+  'Output 3: SCK (clock) pin for all chips.
+  'Output 4 : CS (Chip Select) for temp_room digital pot (set low to load shift register for chip)
+  'Output 5:  CS for temp_water digital pot
+  'Output 6: CS for temp_flue digital pot.
+  lp_num = 0
+  HIGH 4   'Set CS high to prevent lock wiper positions.
+  HIGH 5
+  HIGH 6
+ '*********Main Program Loop***************************
+  DO
+    DEBUG HOME
+    IF lp_num = 6000 THEN  ' This is used to set the anti-freeze cycling period. Each loop is a bit more than a second.
+      lp_num = 0
+    ENDIF
+
+    GOSUB Autopoll 'Get temperatures
+    'IF temp_flue >=  220 THEN ctr_flue =  0  'V15  move
+    IF temp_flue > 250 OR fan_flg = 1 THEN  'Control Pump
+      HIGH 1  'Turn on pump
+      low_flue = 0
+      ctr_flue = 0  'V16
+    ELSEIF temp_flue < 220  THEN
+      DO UNTIL ctr_flue => 20 OR temp_flue >= 220
+        IF temp_flue < 220 THEN 'This is the flue TC noise rejection logic added in V13
+          PAUSE 2000 '  Delay is this number * number of loops (ms)
+          GOSUB dataout   'v15 add
+          GOSUB Autopoll
+          GOSUB Potset
+          ctr_flue =  ctr_flue  + 1
+          low_flue = 1
+          'DEBUG "Flue TC Noise Rej - Counter =  ", DEC3 ctr_flue, "  low_flue = " ,DEC3 low_flue, "  temp_flue = ", DEC3 temp_flue, CR
+        ELSE
+          'ctr_flue =  20
+          low_flue = 0
+        ENDIF
+      LOOP
+      IF (low_flue = 1 AND temp_flue <220) THEN LOW 1 'turn off pump ONLY if flue_temp has been low for many loops.
+    ENDIF
+
+    IF temp_water > 1900 THEN   'Water overtemperature control
+        water_ot_flg = 1
+        HIGH 0 ' Turn on furnace fan
+    ELSEIF temp_water < 1850 AND water_ot_flg = 1 THEN
+        LOW 0
+        water_ot_flg = 0
+    ENDIF
+    '********Room Temperature Flag**************
+    IF (temp_room < (temp_room_sp - 0)) THEN
+      rm_flg = 1  'Need heat
+    ELSEIF   (temp_room >= (temp_room_sp + 12)) THEN
+      rm_flg = 0  'Do not need heat
+    ENDIF
+
+     'Room temperature based heat demand control  If fire is out draw tank temp all the way down so water does not have
+     'to run through cold firebox during draw down.
+    IF (rm_flg = 1 AND (temp_water > 1320)) OR (temp_flue < 220 AND temp_water > 1130 AND rm_flg = 1) THEN   'V15 220 was 150
+      HIGH 0 'Turn on furnace fan
+      fan_flg = 1
+    ELSEIF (rm_flg = 0 AND(water_ot_flg = 0))OR((temp_water < 1250 AND temp_flue >220)OR(temp_flue < 220 AND temp_water < 1080))THEN'v15 220  was 200
+      LOW 0 'Turn off furnace fan
+      fan_flg = 0
+    ENDIF
+    IF temp_flue < 65 AND lp_num = 4 THEN  'Freeze Protection - Cycle pump.
+      HIGH  1
+      PAUSE 10000
+      LOW 0
+    ENDIF
+
+    GOSUB Potset 'Set digital pots to achieve analog voltage outs. Temperature = mV
+
+     'DEBUG HOME
+    DEBUG "temp_room = ", DEC4 temp_room, " temp_water = ", DEC4 temp_water, " temp_flue = ", DEC4 temp_flue, " lp_num = " , DEC5 lp_num, CR
+    DEBUG "temp_board = ", DEC5 temp_board, " temp_room_sp = " , DEC5 temp_room_sp," water_ot_flg = ", BIN1 water_ot_flg," rm_flg = ",BIN1 rm_flg," low_flue = ",DEC3 low_flue, CR
+    'DEBUG "             OUTH = ", BIN8 OUTH, "             OUTL = ", BIN8 OUT1, "                         ", CR
+     'DEBUG "ctr_room = ", DEC3 ctr_room, " ctr_water = ", DEC3 ctr_water, " ctr_flue = ", DEC3 ctr_flue, " lp_num = ", DEC5 lp_num, CR
+    ' DEBUG "low_flue = ",DEC3 low_flue, CR
+    lp_num = lp_num + 1
+     '*********Take PLX_DAQ data if needed********************
+    'IF dat_ctr = 0 THEN
+   '   dat_ctr = dat_ctr + 1
+      GOSUB dataout
+   ' ELSEIF dat_ctr = 24 THEN ' This is where data acq rate is set.
+    '  dat_ctr = 0
+    'ELSE
+    '  dat_ctr = dat_ctr + 1
+    'ENDIF
+     '******************************************************
+  PAUSE 2000
+  LOOP
+ '*********This sub gets temperatures******************
+  Autopoll:
+  HIGH 7
+  HIGH 8
+  LOW 9
+  HIGH 10
+  HIGH 11
+  PAUSE 500
+  RCTIME 7,1,time
+  GOSUB therm_lookup  'Temp_water
+
+  x = ((1*x) + (temp_water * 9))   'Filter
+  x_old = (((1*x) + (temp_water * 9))/10) *10
+  IF x - x_old >= 5 THEN  'Round
+    temp_water =  x/10+1
+  ELSE
+    temp_water =  x/10
+  ENDIF
+  'DEBUG  "time_water = ", DEC5 time, " fact_water = ", DEC3 fact, CR
+
+  RCTIME 8, 1, time
+  GOSUB therm_lookup 'Temp_room
+
+  x = ((1*x) + (temp_room * 9))   'Filter
+  x_old = (((1*x) + (temp_room * 9))/10) *10  ' V17 changed to 9 from 8 for more filtering.
+  IF x - x_old >= 5 THEN  'Round
+   temp_room =  x/10+1
+  ELSE
+    temp_room =  x/10
+  ENDIF
+
+ ' DEBUG  "time_room = ", DEC5 time, " fact_room = ", DEC3 fact, CR
+  RCTIME 9,0, time
+  GOSUB tc_lookup
+  'Subtract the 87 deg F built into tranfer function to prevent negative and abritrate against negative.
+  'One flaw in this TC routine is that if the TC voltage goes negative enough (below -12 mV) the RCTIME will roll
+  'from max to 0 (low to max temp_flue output.
+  IF( x + temp_board) > 0 THEN  ' was 87 Was 77 then set to 0 in 2 places.
+    temp_flue = (((x + temp_board - 0) * 15)+ (temp_flue * 15))/30   'Filter  and subtract board junction temp.
+  ELSE
+  temp_flue = 0
+  ENDIF
+  'DEBUG "time_TC = ", DEC5 time, " fact_TC = ", DEC5 fact, " x_tc = ", DEC5 x, CR
+  'PAUSE 10000
+  RCTIME 10, 1, time
+  GOSUB therm_lookup
+  temp_board = x /10
+  'DEBUG "time_board = ", DEC5 time, " fact_board = ", DEC5 fact, " x_board = ", DEC5 x, CR
+
+  RCTIME 11, 1, time
+  GOSUB therm_lookup 'temp_room_sp
+ '**********************Rate Limiting Logic************************
+ ' IF (x-temp_room_sp) >  1 THEN   'Rate limiting logic.  This code does not work. Causes to go to 671.
+ '     x = x + 1            ' Finish working on this.
+ ' ELSEIF(x-temp_room_sp < -1)  THEN
+  '    x = x-1
+  'ENDIF
+  'temp_room_sp =  x
+  '*******************END Rate Limiting Logic*********************
+  x = ((1*x) + (temp_room_sp * 9))   'Filter V15 this logic may be replaced by rate limiting.
+  x_old = (((1*x) + (temp_room_sp * 9))/10) *10
+  IF x - x_old >= 5 THEN 'Round
+    temp_room_sp =  x/10+1
+  ELSE
+    temp_room_sp =  x/10
+  ENDIF
+  RETURN
+
+therm_lookup: ' For thermistors
+  counter = 0
+  IF time <= 32 THEN 'Pegged out at low end
+    x = 246
+    RETURN
+  ELSEIF time => 27644 THEN  'Pegged out at high end
+    x = 24
+
+    RETURN
+  ENDIF
+  x = 32 'Set to lowest of lookup x array
+  DO UNTIL (x >time OR counter = 255)
+    x_old = x
+    counter = counter + 1
+    LOOKUP counter, [32,95,159,222,285,349,412,1045,1679,2312,2945,3579,4212,4845,5479,6112,6745,7378,8012,8645,9278,  9912,10545,11178,12445,13711,14978,16245,17511,18778,20044,21311,22578,23844,25111,26377,27644],x
+    'DEBUG CR, DEC counter
+  LOOP
+
+  x_old = x_old/10
+  x = x/10
+  time = time/10
+  fact = (x - time)*256 /(x-x_old)
+
+  LOOKUP counter -1,[2460,  2310,  2190,  2100,  2010,  1940,  1880,  1500,  1300,  1160,  1060,  980,  920,  860,  810,  770,  730,  700,  670,  640,  610,  590,  570,  550,  510,  470,  440,  410,  390,  360,  340,  320,  300,  290,  270,  250,  240], x_old
+  LOOKUP counter  ,[2460,  2310,  2190,  2100,  2010,  1940,  1880,  1500,  1300,  1160,  1060,  980,  920,  860,  810,  770,  730,  700,  670,  640,  610,  590,  570,  550,  510,  470,  440,  410,  390,  360,  340,  320,  300,  290,  270,  250,  240], x
+  x = x+((x_old-x)*/fact)
+  RETURN
+  '*****************************
+  tc_lookup: 'For THermocouples
+
+  counter = 0
+  IF time <= 4740 THEN 'Pegged out at low end
+    x = 1326
+    RETURN
+  ELSEIF time => 16370 THEN  'Pegged out at high end
+    x = 0
+    RETURN
+  ENDIF
+  x = 3650 'Set to lowest of lookup x array
+  DO UNTIL (x > time OR counter > 251)
+    x_old = x
+    counter = counter + 1
+    LOOKUP counter, [4740,5170, 5740, 6550, 7475, 8650,10310,11470,12610,14100,15100,16370],x
+  LOOP
+  x_old = x_old/10
+  x = x/10
+  time = time/10
+  fact = (x - time)*256 /(x-x_old)
+  'DEBUG "counter = ", DEC3 counter, " x_old = ", DEC5 x_old, " x = ", DEC5 x, CR
+  LOOKUP counter -1,[1326,  1183,  1028,  842,  678,  523,  354,  268,  199,  74,  43, 0], x_old
+  LOOKUP counter  ,[1326,  1183,  1028,  842,  678,  523,  354,  268,  199,  74,  43, 0], x
+  x = x+((x_old-x)*/fact)
+  'DEBUG "x = ", DEC5 x, CR
+
+  RETURN
+
+  '********PLX_DAQ Data Out**************************
+  dataout:
+  row_ctr = row_ctr + 1
+  ' Send String with data for Excel
+  SEROUT 16,84,["DATA,TIME,TIMER,", DEC temp_flue, ",", DEC temp_water,",", DEC temp_room,",", DEC temp_room_sp, ",",  BIN water_ot_flg,",", BIN fan_flg,",", BIN low_flue,",", BIN rm_flg,",", DEC ctr_flue,",", DEC lp_num, ",", BIN1 OUT1, CR]
+  'IF row_ctr >= 60000 THEN SEROUT 16,84,["ROW,SET,2",CR]   ' Reset row in excel sheet.
+  RETURN
+
+
+  Potset: ' Set digital pots for output to voltmeters
+    ctr_room = temp_room/10 MAX 255
+    LOW 4
+    SHIFTOUT 2,3,MSBFIRST,[17,ctr_room]
+    HIGH 4
+
+    LOW 5
+    ctr_water = temp_water/10 MAX 255
+    SHIFTOUT 2,3,MSBFIRST,[17,ctr_water]
+    HIGH 5
+
+    LOW 6
+    ctr_water = temp_flue/5 MAX 255   'repurposed ctr_flue on version 14 due to lack of RAM.
+    'ctr_flue gets used in TC noise rejection too. Prevents conflicts.
+    SHIFTOUT 2,3,MSBFIRST,[17,ctr_water]
+    HIGH 6
+  RETURN
